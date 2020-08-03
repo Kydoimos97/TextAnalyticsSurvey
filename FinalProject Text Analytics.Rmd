@@ -1,0 +1,532 @@
+---
+title: "Final Project Text Analytics"
+author: "Willem van der Schans"
+date: "7/29/2020"
+output:
+  html_document:
+    fig_height: 6
+    fig_width: 10
+    highlight: kate
+    number_sections: yes
+    theme: paper
+    toc: yes
+    toc_float: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "C:/Users/wille/OneDrive/MSF&MSBA/Summer 2020/MKTG 6640 Text Analytics/Final Project TA/Working Folder/")
+options("expressions"=80000)
+```
+
+# Load Packages
+
+```{r load_packages, echo=T, message=FALSE, warning=FALSE}
+require(dplyr)
+require(data.table)
+require(quanteda)
+require(quanteda.textmodels)
+require(caret)
+require(tidyverse)
+require(kableExtra)
+library(rminer)
+library(caret)
+library(doSNOW)
+library(Rfast)
+library(irlba)
+library(ggplot2)
+library(ggthemes)
+library(tictoc)
+library(nnet)
+
+tic()
+```
+
+# Data Loading and preperation
+
+```{r data_loading}
+df_imdb <- as.data.frame(fread("C:/Users/wille/OneDrive/MSF&MSBA/Summer 2020/MKTG 6640 Text Analytics/Final Project TA/Working Folder/IMDB Dataset.csv", encoding = "UTF-8", stringsAsFactors =F ))
+```
+
+## Decrease data set dimensions due to hardware limitations.
+
+```{r dimension_reduction}
+#  make the dataset
+df_imdb_split <- createDataPartition(df_imdb$sentiment, times = 1,p = .25, list = FALSE)
+df_imdb <- df_imdb[df_imdb_split,]
+```
+
+## Rename target variable factor levels
+
+```{r target_rename}
+pre_level_names <- levels(as.factor(df_imdb$sentiment))
+post_level_names <- c(0,1)
+df_imdb$sentiment<- as.factor(plyr::mapvalues(df_imdb$sentiment, pre_level_names , post_level_names))
+
+rm(post_level_names, pre_level_names)
+```
+
+## Show Data Head
+
+```{r head}
+head(df_imdb,2)
+```
+
+
+## Show Distribution of Target Variable
+
+```{r distribution}
+df_imdb %>% count(sentiment)%>% mutate(freq=round(n/sum(n)*100,2))
+```
+
+## Show Average document length
+
+```{r documentlength}
+df_reuters <- as.data.frame(fread("C:/Users/wille/OneDrive/MSF&MSBA/Summer 2020/MKTG 6640 Text Analytics/Final Project TA/Working Folder/reuterstest.csv", encoding = "UTF-8", stringsAsFactors =F ))
+
+
+paste0("Average Word lenght per document = ",
+       round(mean(sapply(df_imdb$review,function(x)length(unlist(gregexpr(" ",x)))+1)),2))
+
+paste0("Average Word lenght per document = ",
+       round(mean(sapply(df_reuters$Header,function(x)length(unlist(gregexpr(" ",x)))+1)),2))
+
+rm(df_reuters)
+```
+
+# Create Test and Train Data Sets
+
+## 80% Hold-Out evalutation
+
+```{r holdout, eval=T}
+set.seed(123)
+
+df_imdb_split <- createDataPartition(df_imdb$sentiment, times = 1,p = .80, list = FALSE)
+train <- df_imdb[df_imdb_split,]
+train_target <- train$sentiment
+test <- df_imdb[-df_imdb_split,]
+test_target <- test$sentiment
+```
+
+## Create a document frequency matrix
+
+```{r documentfrequencymatrix}
+# Train
+train_token_sm <- tokens(train$review, what = "word",
+remove_numbers = TRUE, remove_punct = TRUE,
+remove_symbols = TRUE, split_hyphens = TRUE) %>%
+tokens_tolower()
+
+train_dfm_trim_sm <-train_token_sm %>%
+tokens_remove(stopwords(source = "smart")) %>%
+tokens_wordstem() %>%
+dfm() %>%
+dfm_tfidf() %>%
+dfm_trim( min_termfreq = 10, min_docfreq = 2)
+
+# Test
+test_token_sm <- tokens(test$review, what = "word",
+remove_numbers = TRUE, remove_punct = TRUE,
+remove_symbols = TRUE, split_hyphens = TRUE) %>%
+tokens_tolower()
+
+test_dfm_trim_sm <-test_token_sm %>%
+tokens_remove(stopwords(source = "smart")) %>%
+tokens_wordstem() %>%
+dfm() %>%
+dfm_tfidf() %>%
+dfm_trim( min_termfreq = 10, min_docfreq = 2)
+```
+
+## Dimension Reduction with LSA
+
+```{r lsa, eval=T}
+# Train
+train_lsa <- irlba(t(train_dfm_trim_sm), nv = 300, maxit = 600)
+train_svd <- data.frame(Label = train$sentiment, ReviewLength= nchar(train$review), train_lsa$v)
+
+# Test
+test_lsa <- irlba(t(test_dfm_trim_sm), nv = 300, maxit = 600)
+test_svd <- data.frame(Label = test$sentiment, ReviewLength= nchar(test$review), test_lsa$v)
+
+
+rm(df_imdb_split, df_imdb,post_level_names, pre_level_names, test_lsa, train_lsa)
+```
+
+# Machine Learning
+
+## Create Metrics Data Frame and set-up variables
+
+```{r metricsframe}
+resultsclassification <- data.frame(Model = as.character(),
+           Sample = as.character(),
+           ACC = numeric(),
+           TPR_Neg = numeric(),
+           TPR_Pos = numeric(),
+           Precision_Neg  = numeric(),
+           Precision_Neg  = numeric(),
+           F1 = numeric())
+
+resultsclassification <- rbind(resultsclassification, c("Test", "Test", 1, 1, 1, 1, 1, 1))
+names(resultsclassification) <- c("Model","Sample","ACC", "TPR_Neg", "TPR_Pos", "Precision_Neg", "Precision_Pos", "F1")
+resultsclassification$Model <- as.character(resultsclassification$Model)
+resultsclassification$Sample <- as.character(resultsclassification$Sample)
+resultsclassification[sapply(resultsclassification, is.factor)] <- lapply(resultsclassification[sapply(resultsclassification, is.factor)], as.numeric)
+
+
+# Key Variables
+set.seed(123)
+metric_list <- c("ACC", "TPR", "PRECISION", "F1")
+cv.folds <- createMultiFolds(train_svd$Label, k = 5, times = 3)
+cv.cntrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, index = cv.folds, allowParallel = TRUE)
+```
+
+## Running Algorithms
+
+### Naive Bayes
+
+```{r naivebayes}
+set.seed(123)
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_NB <- train(Label ~ ., data = train_svd, method = "naive_bayes", 
+                  trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneLength = 7)
+
+model_NB
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+total.time_NB <- difftime(Sys.time(), start.time, units = "secs")
+total.time_NB
+
+#Train
+prediction_train <- predict(model_NB , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_NB , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("Naive Bayes","In-sample"))
+testset  <- prepend(unname(metrics_test), c("Naive Bayes", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification <- resultsclassification[-1,]
+
+resultsclassification
+```
+
+### Random Forest
+
+```{r randomforest}
+set.seed(123)
+cv.folds <- createMultiFolds(train_svd$Label, k = 3, times = 2)
+
+cv.cntrl <- trainControl(method = "repeatedcv", number = 3, repeats = 2, index = cv.folds, allowParallel = TRUE, verboseIter = TRUE, search='grid')
+
+tunegrid <- expand.grid(.mtry = c(27,35,79)) 
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_rf <- train(Label ~ ., data = train_svd, method = "parRF", 
+                  trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneGrid = tunegrid)
+
+model_rf
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+total.time_rf <- difftime(Sys.time(), start.time, units = "secs")
+total.time_rf
+
+#Train
+prediction_train <- predict(model_rf , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_rf , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("Random Forest","In-sample"))
+testset  <- prepend(unname(metrics_test), c("Random Forest", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification
+```
+
+### Neural Network
+
+```{r neuralnetwork, echo=T, message=FALSE, warning=FALSE}
+set.seed(123)
+cv.cntrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, index = cv.folds, allowParallel = TRUE)
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_nnet <- train(Label ~ ., data = train_svd, method = "nnet", 
+                    trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneLength = 7)
+
+model_nnet
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+total.time_nnet <- difftime(Sys.time(), start.time, units = "secs")
+total.time_nnet
+
+#Train
+prediction_train <- predict(model_nnet , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_nnet , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("Neural Network","In-sample"))
+testset  <- prepend(unname(metrics_test), c("Neural Network", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification
+```
+
+### Rule-Based Classification
+
+```{r rulebased}
+set.seed(123)
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_rpart <- train(Label ~ ., data = train_svd, method = "rpart", 
+                     trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneLength = 7)
+model_rpart
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+
+total.time_rpart <- difftime(Sys.time(), start.time, units = "secs")
+total.time_rpart
+
+#Train
+prediction_train <- predict(model_rpart , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_rpart , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("Rule-Based Classifier","In-sample"))
+testset  <- prepend(unname(metrics_test), c("Rule-Based Classifier", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification
+```
+
+### SVM
+
+```{r svm}
+set.seed(123)
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_svm <- train(Label ~ ., data = train_svd, method = "svmLinear", 
+                   trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneLength = 7)
+
+model_svm
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+
+total.time_svm <- difftime(Sys.time(), start.time, units = "secs")
+total.time_svm
+
+#Train
+prediction_train <- predict(model_svm , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_svm , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("Support vector Machine","In-sample"))
+testset  <- prepend(unname(metrics_test), c("Support vector Machine", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification
+```
+
+### KNN
+
+```{r knn, echo=T, message=FALSE, warning=FALSE}
+set.seed(123)
+# Time the code execution
+start.time <- Sys.time()
+
+# set-up Parallel Processing
+cl <- makeCluster(4, type = "SOCK")
+registerDoSNOW(cl) 
+
+# Run the Model
+model_knn <- train(Label ~ ., data = train_svd, method = "knn", 
+                   trControl = cv.cntrl, metric = "Accuracy", maximize = TRUE, tuneLength = 7)
+
+model_knn
+# Stop Parallel Processing
+stopCluster(cl)
+
+# Total time of execution
+
+total.time_knn <- difftime(Sys.time(), start.time, units = "secs")
+total.time_knn
+
+#Train
+prediction_train <- predict(model_knn , train_svd)
+(metrics_train <- round(mmetric(train_target, prediction_train,metric_list),2))
+
+#Test
+prediction_test <- predict(model_knn , test_svd)
+(metrics_test <- round(mmetric(test_target, prediction_test,metric_list),2))
+
+trainset <- prepend(unname(metrics_train), c("K-Nearest Neighbours","In-sample"))
+testset  <- prepend(unname(metrics_test), c("K-Nearest Neighbours", "Out-of-sample"))
+
+resultsclassification <- rbind(resultsclassification, trainset)
+resultsclassification <- rbind(resultsclassification, testset)
+
+resultsclassification
+```
+
+# Classification Results
+
+## Performance Metrics
+
+### Plot
+
+```{r performanceplot}
+row.names(resultsclassification) <- c(1:nrow(resultsclassification))
+
+
+resultsclassification %>% ggplot(aes(x=Model,y=as.numeric(ACC), group=Sample, fill=Sample)) + 
+  geom_bar (stat="identity", position = position_dodge(width = 0.5)) +
+  geom_text(aes(x=Model,label=as.numeric(ACC), group=Sample, fill=Sample),
+            position=position_dodge(width = 0.5), vjust = 2, color = "Black" , 
+            size = 3, angle=0, check_overlap=T) +
+  theme_fivethirtyeight() +
+  labs(title = "Classification Model Performance", 
+       subtitle = "Higher is better") +
+  theme(axis.title = element_text()) + 
+  ylab("Accuracy Score") + 
+  xlab("Classification Models") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) + 
+  coord_cartesian(ylim=c((floor(min(as.numeric(resultsclassification$ACC))/ 5)-1)*5,
+                         (ceiling(max(as.numeric(resultsclassification$ACC))/ 5)+1)*5)) +
+  scale_fill_tableau() 
+```
+
+### Table
+
+```{r performancetable}
+kable(resultsclassification, format.args = list(big.mark = ","), 
+      align = "llcccc", format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = F, position = "center")
+```
+
+## Run time
+
+```{r runtimedf}
+Run_time <- c(round(as.numeric(total.time_NB),0),
+               round(as.numeric(total.time_rf)*(105/18),0),
+               round(as.numeric(total.time_nnet),0),
+               round(as.numeric(total.time_rpart),0),
+               round(as.numeric(total.time_svm),0),
+               round(as.numeric(total.time_knn),0))
+Algorithm_list <- c("Naive Bayes", "Random Forest", "Neural Network", "Rule Based Classification", "Support Vector Machine", "K-Nearest Neighbour")
+
+time_outcome <- data.frame(Algorithm_list,Run_time)
+```
+
+### Plot
+
+```{r runtimeplot}
+time_outcome %>% ggplot(aes(x=reorder(Algorithm_list, as.numeric(Run_time)),
+                            y=Run_time, group=Algorithm_list, fill=Algorithm_list)) + 
+  geom_bar (stat="identity", position = position_dodge(width = 0.5)) +
+  theme_fivethirtyeight() +
+  labs(title = "Classification Model Run Time", 
+       subtitle = "Logarithmic scale, In Seconds, Lower is better") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+  theme(axis.title = element_text(angle = 0))+ 
+  ylab("Runtime in minutes") + 
+  xlab("Classification Models") +
+  geom_text(aes(label = round(Run_time, digits = 0)), 
+            position=position_stack(vjust = 0.5), color = "Black" , size = 3.5, angle=0,  
+                  inherit.aes = T, check_overlap=T) +
+  scale_y_continuous(labels = function(x) paste0(x, "")) +
+  scale_y_log10() + scale_fill_tableau() + theme(legend.position = "none")
+```
+
+### Table
+
+```{r runtimetable}
+kable(time_outcome, format.args = list(big.mark = ","), 
+      align = "lc", format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = F, position = "center")
+```
+
+
+```{r endcodetime}
+toc()
+```
+
+
+
+
+
+
+
+
+
+
+
